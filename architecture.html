@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EdgeCuda Architecture Plan</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #06100d;
+        --panel: rgba(12, 31, 26, 0.86);
+        --line: rgba(126, 255, 202, 0.22);
+        --text: #eafff7;
+        --muted: #98cbb8;
+        --good: #3dffaf;
+        --blue: #6bc7ff;
+        --warn: #ffd166;
+        --bad: #ff5d78;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Bahnschrift", "Aptos Display", "Segoe UI", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at 12% 8%, rgba(61, 255, 175, 0.22), transparent 30rem),
+          radial-gradient(circle at 86% 12%, rgba(107, 199, 255, 0.14), transparent 34rem),
+          linear-gradient(135deg, #020504 0%, #071711 52%, #11170e 100%);
+      }
+
+      main {
+        width: min(1500px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 34px 0 44px;
+      }
+
+      header {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 360px;
+        gap: 22px;
+        align-items: end;
+        margin-bottom: 22px;
+      }
+
+      h1 {
+        margin: 0;
+        max-width: 980px;
+        font-size: clamp(3.5rem, 8vw, 7.8rem);
+        line-height: 0.82;
+        letter-spacing: -0.08em;
+        text-transform: uppercase;
+      }
+
+      h2,
+      h3,
+      p {
+        margin-top: 0;
+      }
+
+      .eyebrow {
+        margin: 0 0 0.65rem;
+        color: var(--good);
+        font-size: 0.74rem;
+        font-weight: 800;
+        letter-spacing: 0.17em;
+        text-transform: uppercase;
+      }
+
+      .lede {
+        max-width: 760px;
+        color: #bdded2;
+        font-size: 1.08rem;
+        line-height: 1.58;
+      }
+
+      .decision-card,
+      .lane,
+      .metric,
+      .stack-card {
+        border: 1px solid var(--line);
+        border-radius: 28px;
+        background: var(--panel);
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+        backdrop-filter: blur(18px);
+      }
+
+      .decision-card {
+        padding: 22px;
+      }
+
+      .decision-card strong {
+        display: block;
+        margin-bottom: 8px;
+        color: var(--good);
+        font-size: 2rem;
+        letter-spacing: -0.05em;
+      }
+
+      .decision-card p {
+        margin-bottom: 0;
+        color: var(--muted);
+        line-height: 1.45;
+      }
+
+      .diagram {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 18px;
+      }
+
+      .lane {
+        min-height: 690px;
+        padding: 22px;
+        position: relative;
+        overflow: hidden;
+      }
+
+      .lane::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(150deg, rgba(255, 255, 255, 0.06), transparent 34%);
+        pointer-events: none;
+      }
+
+      .lane > * {
+        position: relative;
+      }
+
+      .lane h2 {
+        margin-bottom: 18px;
+        font-size: 1.2rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+
+      .node {
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 21px;
+        padding: 17px;
+        margin: 15px 0;
+        background: rgba(255, 255, 255, 0.055);
+      }
+
+      .node.good {
+        border-color: rgba(61, 255, 175, 0.68);
+      }
+
+      .node.blue {
+        border-color: rgba(107, 199, 255, 0.68);
+      }
+
+      .node.warn {
+        border-color: rgba(255, 209, 102, 0.72);
+      }
+
+      .node.bad {
+        border-color: rgba(255, 93, 120, 0.84);
+      }
+
+      .node strong {
+        display: block;
+        margin-bottom: 7px;
+        font-size: 1.12rem;
+      }
+
+      .node span {
+        display: block;
+        color: var(--muted);
+        line-height: 1.45;
+      }
+
+      .arrow {
+        color: var(--good);
+        font-size: 1.8rem;
+        text-align: center;
+      }
+
+      .cross-arrow {
+        margin: 20px 0;
+        border: 1px dashed rgba(107, 199, 255, 0.44);
+        border-radius: 999px;
+        padding: 0.8rem;
+        color: #c9f0ff;
+        text-align: center;
+      }
+
+      .footer {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 16px;
+        margin-top: 18px;
+      }
+
+      .metric {
+        padding: 18px;
+      }
+
+      .metric b {
+        display: block;
+        margin-bottom: 8px;
+        color: var(--good);
+        font-size: 1.7rem;
+      }
+
+      .metric span {
+        color: var(--muted);
+        line-height: 1.4;
+      }
+
+      .stack {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 18px;
+        margin-top: 18px;
+      }
+
+      .stack-card {
+        padding: 22px;
+      }
+
+      .stack-card ul {
+        margin: 0;
+        padding-left: 1.1rem;
+        color: #c1e4d7;
+        line-height: 1.7;
+      }
+
+      @media (max-width: 1050px) {
+        header,
+        .diagram,
+        .footer,
+        .stack {
+          grid-template-columns: 1fr;
+        }
+
+        .lane {
+          min-height: auto;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <section>
+          <p class="eyebrow">EdgeCuda Plan Visualization</p>
+          <h1>Recursive ZK Tactical Swarm</h1>
+          <p class="lede">
+            A planning-level architecture diagram for a BitTorrent-over-MANET swarm
+            secured by lightweight recursive proofs and visualized through a future
+            Kepler.gl commander map.
+          </p>
+        </section>
+
+        <aside class="decision-card">
+          <p class="eyebrow">Recommended Proof Track</p>
+          <strong>Plonky2 recursion</strong>
+          <p>
+            Use Plonky2 for recursive aggregation. Keep Groth16 as a leaf-proof
+            comparison path, not the primary recursive architecture.
+          </p>
+        </aside>
+      </header>
+
+      <section class="diagram" aria-label="EdgeCuda architecture diagram">
+        <article class="lane">
+          <p class="eyebrow">Lane 01</p>
+          <h2>Tactical Data Flow</h2>
+
+          <div class="node good">
+            <strong>Commander Node</strong>
+            <span>Owns the approved mission payload and publishes the Merkle root.</span>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node">
+            <strong>Chunking Layer</strong>
+            <span>Splits the 10 GB file into chunks and hashes leaves into a Merkle tree.</span>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node blue">
+            <strong>BitTorrent-over-MANET</strong>
+            <span>Drones trade missing chunks with local peers instead of all pulling from command.</span>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node warn">
+            <strong>Bandwidth Delta</strong>
+            <span>Commander avoids repeated full-file broadcast and sends only seed data plus proof traffic.</span>
+          </div>
+        </article>
+
+        <article class="lane">
+          <p class="eyebrow">Lane 02</p>
+          <h2>Recursive Proof Path</h2>
+
+          <div class="node">
+            <strong>Leaf Chunk Proof</strong>
+            <span>Each drone proves chunk membership against the commander-approved root.</span>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node good">
+            <strong>Pairwise Aggregation</strong>
+            <span>Peers verify and combine proof states in a recursive tree.</span>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node good">
+            <strong>Final Swarm Proof</strong>
+            <span>The commander receives one aggregate proof for the verified swarm state.</span>
+          </div>
+          <div class="cross-arrow">Invalid proof exits aggregation path</div>
+          <div class="node bad">
+            <strong>Quarantine Decision</strong>
+            <span>Bad chunks, spoofed roots, or malformed proofs remove the node from routing.</span>
+          </div>
+        </article>
+
+        <article class="lane">
+          <p class="eyebrow">Lane 03</p>
+          <h2>Commander Visualization</h2>
+
+          <div class="node good">
+            <strong>Kepler.gl Map</strong>
+            <span>Primary geospatial layer for drone positions, routes, trust state, and time playback.</span>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node">
+            <strong>Swarm Dataset</strong>
+            <span>Rows include node id, lat/lon, route id, chunk count, proof status, and trust state.</span>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node warn">
+            <strong>Metrics Overlay</strong>
+            <span>Shows bandwidth saved, verified nodes, quarantined nodes, and aggregation depth.</span>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node bad">
+            <strong>Quarantine Overlay</strong>
+            <span>Failed nodes turn red and disappear from active P2P route calculations.</span>
+          </div>
+        </article>
+      </section>
+
+      <section class="footer">
+        <div class="metric">
+          <b>Kepler.gl</b>
+          <span>Use for the real commander map and playback visualization.</span>
+        </div>
+        <div class="metric">
+          <b>Plonky2</b>
+          <span>Best fit for lightweight recursive proof aggregation.</span>
+        </div>
+        <div class="metric">
+          <b>Groth16</b>
+          <span>Good for small proof comparison, weaker fit for recursion.</span>
+        </div>
+        <div class="metric">
+          <b>MANET</b>
+          <span>Simulated P2P routing layer for the hackathon prototype.</span>
+        </div>
+      </section>
+
+      <section class="stack">
+        <article class="stack-card">
+          <p class="eyebrow">Implementation Order</p>
+          <ul>
+            <li>Static architecture visualization first.</li>
+            <li>Kepler.gl dataset schema second.</li>
+            <li>Swarm simulation and bandwidth metrics third.</li>
+            <li>Plonky2 recursive proof spike after the demo story is stable.</li>
+          </ul>
+        </article>
+        <article class="stack-card">
+          <p class="eyebrow">Risk Control</p>
+          <ul>
+            <li>Do not claim full recursive ZK unless the Plonky2 spike runs.</li>
+            <li>Do not use Groth16 as the recursive proof layer.</li>
+            <li>Keep live OSINT optional; synthetic data is safer for judging.</li>
+            <li>Present ESP32 as verifier feasibility, not proof generation.</li>
+          </ul>
+        </article>
+      </section>
+    </main>
+  </body>
+</html>
