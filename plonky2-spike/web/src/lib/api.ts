@@ -4,7 +4,6 @@ import type {
   FaultKind,
   FileReceipt,
   IntegrityReport,
-  ManetState,
   SwarmState,
   Target,
   VerifiedEpoch,
@@ -47,10 +46,6 @@ export function fetchSwarm(drones: number): Promise<SwarmState> {
 
 export function fetchDrone(id: number): Promise<DroneDetail> {
   return getJson<DroneDetail>(`/api/drone?id=${id}`);
-}
-
-export function fetchManet(): Promise<ManetState> {
-  return getJson<ManetState>("/api/manet");
 }
 
 export interface MutationBase {
