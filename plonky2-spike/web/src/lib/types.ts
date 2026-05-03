@@ -90,21 +90,9 @@ export interface SwarmState {
   drones: DroneSummary[];
 }
 
-export interface FileReceipt {
-  accepted: boolean;
-  name: string;
-  hash: string;
-  bytes: number;
-  version: number;
-  delivered: number;
-  expected_drones: number[];
-}
-
 export type FaultKind =
   | "rotating"
   | "none"
   | "dropout"
   | "corrupt"
   | "replay";
-
-export type Target = "all" | "drone";
