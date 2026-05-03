@@ -1,22 +1,24 @@
 # Mycelium
 
-Mycelium is a lightweight data verification layer for swarm drone networks. It lets a commander trust distributed mission data without downloading every shard: drones prove shard possession with Poseidon Merkle inclusion proofs, H1 aggregators fold those leaf proofs, and a recursive Plonky2 proof compresses the swarm state into one commander-verifiable verdict.
+Mycelium is a lightweight data verification layer for swarm drone networks. It lets a commander trust distributed mission data without downloading every shard: drones prove shard possession with Poseidon Merkle inclusion proofs, H1 aggregators fold those leaf proofs, a recursive Plonky2 proof compresses the swarm state, and a final BN254 Groth16 wrap is the command-center deliverable.
 
-The current repo is the local proof-of-concept for that protocol. A laptop acts as the field edge verifier, the backend is a Rust service, the proof stack is native Plonky2 over Goldilocks/Poseidon, the dashboard is served from the verifier binary, and MANET delivery is modeled through an ns-3 sidecar when available.
+The current repo is the local proof-of-concept for that protocol. A laptop acts as the field edge verifier, the backend is a Rust service, the intermediate proof stack is native Plonky2 over Goldilocks/Poseidon, the final proof stage is Groth16 over BN254, the dashboard is served from the verifier binary, and MANET delivery is modeled through an ns-3 sidecar when available.
 
 ## Core Protocol
 
 - Drone leaves prove they hold expected data shards without exposing raw shard data.
 - H1 aggregator nodes fold groups of drone proofs into a smaller proof state.
 - A recursive Plonky2 root proof binds epoch, manifest root, nonce, and participation bitmap.
-- The commander checks one compact proof instead of auditing every drone directly.
+- A required Groth16 wrap binds that verified Plonky2 artifact into the compact command-center payload.
+- The commander checks the Groth16 payload instead of auditing every drone directly.
 - Dropouts stay visible as unset bitmap bits, while corrupt or replayed data is rejected.
 
 ## Protocol Path
 
 ```text
 drone shard -> Poseidon Merkle proof -> H1 aggregate fold
-            -> recursive Plonky2 root proof -> commander verdict
+            -> recursive Plonky2 root proof -> BN254 Groth16 wrap
+            -> commander verdict
 ```
 
 Every proof step carries a stable public input shape:

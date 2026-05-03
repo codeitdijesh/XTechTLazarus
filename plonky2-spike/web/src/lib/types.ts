@@ -2,6 +2,7 @@ export type ProofMode = "recursive_chain" | string;
 
 export interface VerifiedEpoch {
   epoch: number;
+  nonce: string;
   drone_count: number;
   accepted: boolean;
   reason: string;
@@ -11,6 +12,11 @@ export interface VerifiedEpoch {
   dropouts: number[];
   verified_count: number;
   proof_bytes: number;
+  groth16_proof_bytes: number;
+  groth16_public_inputs: number;
+  groth16_constraints: number;
+  groth16_fingerprint: string;
+  plonky2_intermediate_proof_bytes: number;
   public_inputs: number;
   prove_ms: number;
   verify_ms: number;

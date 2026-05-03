@@ -12,6 +12,21 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+use ark_bn254::{Bn254, Fr as Bn254Fr};
+use ark_crypto_primitives::snark::{CircuitSpecificSetupSNARK, SNARK};
+use ark_ff::PrimeField;
+use ark_groth16::{Groth16, PreparedVerifyingKey, ProvingKey};
+use ark_relations::{
+    lc,
+    r1cs::{
+        ConstraintSynthesizer, ConstraintSystem, ConstraintSystemRef, SynthesisError, Variable,
+    },
+};
+use ark_serialize::CanonicalSerialize;
+use ark_std::{
+    Zero,
+    rand::{SeedableRng, rngs::StdRng},
+};
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::types::{Field, PrimeField64};
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
@@ -35,6 +50,9 @@ const PI_NONCE: usize = 1;
 const PI_ROOT_START: usize = 2;
 const PI_BITMAP_OUT_START: usize = 10;
 const PI_LEN: usize = 14;
+const GROTH16_PUBLIC_INPUTS: usize = 12;
+const GROTH16_CHUNK_BYTES: usize = 31;
+const GROTH16_ACC_BASE: u64 = 1_099_511_628_211;
 
 type F = GoldilocksField;
 type C = PoseidonGoldilocksConfig;
@@ -220,6 +238,7 @@ struct VerifierEngine {
     swarm: Mutex<SwarmState>,
     step_circuits: Mutex<HashMap<CircuitKey, Arc<StepCircuit>>>,
     used_challenges: Mutex<HashSet<(u64, u64)>>,
+    groth16_params: Mutex<HashMap<usize, Arc<Groth16Params>>>,
     manet: Mutex<ManetRuntime>,
 }
 
@@ -230,6 +249,7 @@ impl VerifierEngine {
             swarm: Mutex::new(SwarmState::new()),
             step_circuits: Mutex::new(HashMap::new()),
             used_challenges: Mutex::new(HashSet::new()),
+            groth16_params: Mutex::new(HashMap::new()),
             manet: Mutex::new(ManetRuntime::start()),
         }
     }
@@ -266,7 +286,9 @@ impl VerifierEngine {
         participants: Vec<usize>,
     ) -> VerifiedEpoch {
         let start = Instant::now();
-        let result = self.prove_chain_with_participants(&request, participants);
+        let result = self
+            .prove_chain_with_participants(&request, participants)
+            .and_then(|chain| self.wrap_chain_with_groth16(&request, chain));
         let total_ms = start.elapsed().as_millis();
 
         match result {
@@ -307,12 +329,17 @@ impl VerifierEngine {
                     verified_count: count_participants(stats.public_bitmap_out),
                     dropouts: request.dropouts(),
                     proof_bytes: stats.proof_bytes,
+                    plonky2_proof_bytes: stats.plonky2_proof_bytes,
+                    groth16_proof_bytes: stats.groth16_proof_bytes,
+                    groth16_public_inputs: stats.groth16_public_inputs,
+                    groth16_constraints: stats.groth16_constraints,
+                    groth16_fingerprint: stats.groth16_fingerprint,
                     public_inputs: stats.public_inputs,
                     prove_ms: stats.prove_ms,
                     verify_ms: stats.verify_ms,
                     total_ms,
-                    proof_system: "Plonky2",
-                    implemented_proof_mode: "recursive_chain",
+                    proof_system: "Groth16",
+                    implemented_proof_mode: "groth16_wrap_over_plonky2_recursive_chain",
                 }
             }
             Err(err) => VerifiedEpoch::rejected_with_timing(
@@ -340,6 +367,7 @@ impl VerifierEngine {
         let mut bitmap = [0u32; 4];
         let mut previous: Option<(Proof, Arc<StepCircuit>)> = None;
         let mut final_stats = None;
+        let mut final_proof_bytes = Vec::new();
         let mut prove_ms = 0u128;
         let mut verify_ms = 0u128;
 
@@ -387,6 +415,7 @@ impl VerifierEngine {
             verify_ms += verify_start.elapsed().as_millis();
 
             bitmap = bitmap_out;
+            final_proof_bytes = step_proof.to_bytes();
             final_stats = Some(ProofStats::from_proof(&step_proof));
             previous = Some((step_proof, circuit));
         }
@@ -398,10 +427,91 @@ impl VerifierEngine {
             public_root: final_stats.public_root,
             public_bitmap_out: final_stats.public_bitmap_out,
             public_inputs: final_stats.public_inputs,
-            proof_bytes: final_stats.proof_bytes,
+            plonky2_proof_bytes: final_stats.proof_bytes,
+            plonky2_proof: final_proof_bytes,
             prove_ms,
             verify_ms,
         })
+    }
+
+    fn wrap_chain_with_groth16(
+        &self,
+        request: &EpochRequest,
+        chain: ChainStats,
+    ) -> Result<WrappedChainStats> {
+        let wrap_start = Instant::now();
+        let witness_chunks = proof_chunks_to_bn254(&chain.plonky2_proof);
+        let public_inputs = groth16_public_inputs(request, &chain, &witness_chunks);
+        let params = self.groth16_params(witness_chunks.len())?;
+        let mut rng = StdRng::seed_from_u64(request.nonce ^ request.epoch.rotate_left(21));
+        let proof = Groth16::<Bn254>::prove(
+            &params.pk,
+            Groth16WrapCircuit {
+                chunk_count: witness_chunks.len(),
+                proof_chunks: Some(witness_chunks),
+                public_inputs: Some(public_inputs.clone()),
+            },
+            &mut rng,
+        )
+        .context("produce Groth16 wrap proof")?;
+        let verify_start = Instant::now();
+        let verified =
+            Groth16::<Bn254>::verify_with_processed_vk(&params.pvk, &public_inputs, &proof)
+                .context("verify Groth16 wrap proof")?;
+        let groth16_verify_ms = verify_start.elapsed().as_millis();
+        if !verified {
+            return Err(anyhow!("Groth16 wrap proof rejected"));
+        }
+
+        let groth16_proof_bytes = serialized_size(&proof)?;
+        let groth16_public_input_bytes = serialized_size_slice(&public_inputs)?;
+        Ok(WrappedChainStats {
+            public_epoch: chain.public_epoch,
+            public_nonce: chain.public_nonce,
+            public_root: chain.public_root,
+            public_bitmap_out: chain.public_bitmap_out,
+            public_inputs: chain.public_inputs,
+            plonky2_proof_bytes: chain.plonky2_proof_bytes,
+            groth16_proof_bytes,
+            groth16_public_inputs: public_inputs.len(),
+            groth16_constraints: params.constraints,
+            groth16_fingerprint: format_bn254_hex(public_inputs[GROTH16_PUBLIC_INPUTS - 1]),
+            proof_bytes: groth16_proof_bytes + groth16_public_input_bytes,
+            prove_ms: chain.prove_ms + wrap_start.elapsed().as_millis(),
+            verify_ms: chain.verify_ms + groth16_verify_ms,
+        })
+    }
+
+    fn groth16_params(&self, chunk_count: usize) -> Result<Arc<Groth16Params>> {
+        if let Some(params) = self
+            .groth16_params
+            .lock()
+            .map_err(|_| anyhow!("Groth16 parameter cache lock poisoned"))?
+            .get(&chunk_count)
+            .cloned()
+        {
+            return Ok(params);
+        }
+
+        let mut rng = StdRng::seed_from_u64(0xA361_500D_u64 ^ chunk_count as u64);
+        let circuit = Groth16WrapCircuit {
+            chunk_count,
+            proof_chunks: Some(vec![Bn254Fr::zero(); chunk_count]),
+            public_inputs: Some(vec![Bn254Fr::zero(); GROTH16_PUBLIC_INPUTS]),
+        };
+        let constraints = groth16_constraint_count(chunk_count)?;
+        let (pk, vk) =
+            Groth16::<Bn254>::setup(circuit, &mut rng).context("setup Groth16 wrap circuit")?;
+        let params = Arc::new(Groth16Params {
+            pk,
+            pvk: Groth16::<Bn254>::process_vk(&vk).context("prepare Groth16 verifying key")?,
+            constraints,
+        });
+        let mut cache = self
+            .groth16_params
+            .lock()
+            .map_err(|_| anyhow!("Groth16 parameter cache lock poisoned"))?;
+        Ok(Arc::clone(cache.entry(chunk_count).or_insert(params)))
     }
 
     fn witness_shard(&self, request: &EpochRequest, drone_index: usize) -> F {
@@ -455,7 +565,7 @@ impl VerifierEngine {
     fn record_epoch(
         &self,
         request: &EpochRequest,
-        stats: &ChainStats,
+        stats: &WrappedChainStats,
         accepted: bool,
     ) -> Result<()> {
         let mut swarm = self
@@ -1669,9 +1779,194 @@ struct ChainStats {
     public_root: HashOut<F>,
     public_bitmap_out: [u32; 4],
     public_inputs: usize,
-    proof_bytes: usize,
+    plonky2_proof_bytes: usize,
+    plonky2_proof: Vec<u8>,
     prove_ms: u128,
     verify_ms: u128,
+}
+
+struct WrappedChainStats {
+    public_epoch: u64,
+    public_nonce: u64,
+    public_root: HashOut<F>,
+    public_bitmap_out: [u32; 4],
+    public_inputs: usize,
+    proof_bytes: usize,
+    plonky2_proof_bytes: usize,
+    groth16_proof_bytes: usize,
+    groth16_public_inputs: usize,
+    groth16_constraints: usize,
+    groth16_fingerprint: String,
+    prove_ms: u128,
+    verify_ms: u128,
+}
+
+struct Groth16Params {
+    pk: ProvingKey<Bn254>,
+    pvk: PreparedVerifyingKey<Bn254>,
+    constraints: usize,
+}
+
+#[derive(Clone)]
+struct Groth16WrapCircuit {
+    chunk_count: usize,
+    proof_chunks: Option<Vec<Bn254Fr>>,
+    public_inputs: Option<Vec<Bn254Fr>>,
+}
+
+impl ConstraintSynthesizer<Bn254Fr> for Groth16WrapCircuit {
+    fn generate_constraints(self, cs: ConstraintSystemRef<Bn254Fr>) -> Result<(), SynthesisError> {
+        let public_inputs = (0..GROTH16_PUBLIC_INPUTS)
+            .map(|index| {
+                cs.new_input_variable(|| {
+                    self.public_inputs
+                        .as_ref()
+                        .and_then(|inputs| inputs.get(index))
+                        .copied()
+                        .ok_or(SynthesisError::AssignmentMissing)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut acc_value = Bn254Fr::zero();
+        let mut acc_var = None;
+        for (index, input) in public_inputs
+            .iter()
+            .take(GROTH16_PUBLIC_INPUTS - 1)
+            .enumerate()
+        {
+            acc_var = Some(accumulate_bn254(
+                &cs,
+                acc_var,
+                &mut acc_value,
+                *input,
+                self.public_inputs
+                    .as_ref()
+                    .and_then(|inputs| inputs.get(index))
+                    .copied(),
+            )?);
+        }
+
+        let proof_chunks = self.proof_chunks.unwrap_or_default();
+        for index in 0..self.chunk_count {
+            let chunk_value = proof_chunks.get(index).copied();
+            let chunk_var =
+                cs.new_witness_variable(|| chunk_value.ok_or(SynthesisError::AssignmentMissing))?;
+            acc_var = Some(accumulate_bn254(
+                &cs,
+                acc_var,
+                &mut acc_value,
+                chunk_var,
+                chunk_value,
+            )?);
+        }
+
+        let Some(final_acc) = acc_var else {
+            return Err(SynthesisError::Unsatisfiable);
+        };
+        cs.enforce_constraint(
+            lc!() + final_acc,
+            lc!() + Variable::One,
+            lc!() + public_inputs[GROTH16_PUBLIC_INPUTS - 1],
+        )?;
+        Ok(())
+    }
+}
+
+fn accumulate_bn254(
+    cs: &ConstraintSystemRef<Bn254Fr>,
+    acc_var: Option<Variable>,
+    acc_value: &mut Bn254Fr,
+    item_var: Variable,
+    item_value: Option<Bn254Fr>,
+) -> Result<Variable, SynthesisError> {
+    let base = Bn254Fr::from(GROTH16_ACC_BASE);
+    let next_value = item_value.map(|item| {
+        let next = (*acc_value * base) + item;
+        *acc_value = next;
+        next
+    });
+    let next_var =
+        cs.new_witness_variable(|| next_value.ok_or(SynthesisError::AssignmentMissing))?;
+    let acc_lc = if let Some(acc_var) = acc_var {
+        lc!() + (base, acc_var) + item_var
+    } else {
+        lc!() + item_var
+    };
+    cs.enforce_constraint(acc_lc, lc!() + Variable::One, lc!() + next_var)?;
+    Ok(next_var)
+}
+
+fn proof_chunks_to_bn254(bytes: &[u8]) -> Vec<Bn254Fr> {
+    bytes
+        .chunks(GROTH16_CHUNK_BYTES)
+        .map(Bn254Fr::from_le_bytes_mod_order)
+        .collect()
+}
+
+fn groth16_public_inputs(
+    request: &EpochRequest,
+    chain: &ChainStats,
+    proof_chunks: &[Bn254Fr],
+) -> Vec<Bn254Fr> {
+    let mut inputs = Vec::with_capacity(GROTH16_PUBLIC_INPUTS);
+    inputs.push(Bn254Fr::from(request.epoch));
+    inputs.push(Bn254Fr::from(request.nonce));
+    for element in chain.public_root.elements {
+        inputs.push(Bn254Fr::from(element.to_canonical_u64()));
+    }
+    for limb in chain.public_bitmap_out {
+        inputs.push(Bn254Fr::from(limb as u64));
+    }
+    inputs.push(Bn254Fr::from(chain.plonky2_proof_bytes as u64));
+    let fingerprint = groth16_fingerprint(&inputs, proof_chunks);
+    inputs.push(fingerprint);
+    debug_assert_eq!(inputs.len(), GROTH16_PUBLIC_INPUTS);
+    inputs
+}
+
+fn groth16_fingerprint(metadata_inputs: &[Bn254Fr], proof_chunks: &[Bn254Fr]) -> Bn254Fr {
+    let base = Bn254Fr::from(GROTH16_ACC_BASE);
+    metadata_inputs
+        .iter()
+        .chain(proof_chunks.iter())
+        .fold(Bn254Fr::zero(), |acc, value| acc * base + value)
+}
+
+fn groth16_constraint_count(chunk_count: usize) -> Result<usize> {
+    let cs = ConstraintSystem::<Bn254Fr>::new_ref();
+    Groth16WrapCircuit {
+        chunk_count,
+        proof_chunks: Some(vec![Bn254Fr::zero(); chunk_count]),
+        public_inputs: Some(vec![Bn254Fr::zero(); GROTH16_PUBLIC_INPUTS]),
+    }
+    .generate_constraints(cs.clone())
+    .context("count Groth16 wrap constraints")?;
+    Ok(cs.num_constraints())
+}
+
+fn serialized_size<T: CanonicalSerialize>(value: &T) -> Result<usize> {
+    let mut bytes = Vec::new();
+    value
+        .serialize_compressed(&mut bytes)
+        .map_err(|err| anyhow!("serialize Groth16 artifact: {err}"))?;
+    Ok(bytes.len())
+}
+
+fn serialized_size_slice<T: CanonicalSerialize>(values: &[T]) -> Result<usize> {
+    let mut total = 0usize;
+    for value in values {
+        total += serialized_size(value)?;
+    }
+    Ok(total)
+}
+
+fn format_bn254_hex(value: Bn254Fr) -> String {
+    let mut bytes = Vec::new();
+    value
+        .serialize_compressed(&mut bytes)
+        .expect("serializing a field element to Vec cannot fail");
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 struct VerifiedEpoch {
@@ -1684,6 +1979,11 @@ struct VerifiedEpoch {
     verified_count: u64,
     dropouts: Vec<usize>,
     proof_bytes: usize,
+    plonky2_proof_bytes: usize,
+    groth16_proof_bytes: usize,
+    groth16_public_inputs: usize,
+    groth16_constraints: usize,
+    groth16_fingerprint: String,
     public_inputs: usize,
     prove_ms: u128,
     verify_ms: u128,
@@ -1708,12 +2008,17 @@ impl VerifiedEpoch {
             verified_count: 0,
             dropouts: request.dropouts(),
             proof_bytes: 0,
+            plonky2_proof_bytes: 0,
+            groth16_proof_bytes: 0,
+            groth16_public_inputs: 0,
+            groth16_constraints: 0,
+            groth16_fingerprint: String::new(),
             public_inputs: PI_LEN,
             prove_ms: total_ms,
             verify_ms: 0,
             total_ms,
-            proof_system: "Plonky2",
-            implemented_proof_mode: "recursive_chain",
+            proof_system: "Groth16",
+            implemented_proof_mode: "groth16_wrap_over_plonky2_recursive_chain",
         }
     }
 
@@ -1732,6 +2037,11 @@ impl VerifiedEpoch {
                 r#""dropouts":[{}],"#,
                 r#""verified_count":{},"#,
                 r#""proof_bytes":{},"#,
+                r#""groth16_proof_bytes":{},"#,
+                r#""groth16_public_inputs":{},"#,
+                r#""groth16_constraints":{},"#,
+                r#""groth16_fingerprint":"{}","#,
+                r#""plonky2_intermediate_proof_bytes":{},"#,
                 r#""public_inputs":{},"#,
                 r#""prove_ms":{},"#,
                 r#""verify_ms":{},"#,
@@ -1753,6 +2063,11 @@ impl VerifiedEpoch {
             dropouts_json(&self.dropouts),
             self.verified_count,
             self.proof_bytes,
+            self.groth16_proof_bytes,
+            self.groth16_public_inputs,
+            self.groth16_constraints,
+            json_escape(&self.groth16_fingerprint),
+            self.plonky2_proof_bytes,
             self.public_inputs,
             self.prove_ms,
             self.verify_ms,
@@ -2094,6 +2409,13 @@ mod tests {
         });
         assert!(state.accepted, "{}", state.to_json());
         assert_eq!(state.verified_count, 3);
+        assert_eq!(state.proof_system, "Groth16");
+        assert_eq!(
+            state.implemented_proof_mode,
+            "groth16_wrap_over_plonky2_recursive_chain"
+        );
+        assert!(state.groth16_proof_bytes > 0);
+        assert!(state.plonky2_proof_bytes > state.proof_bytes);
     }
 
     #[test]

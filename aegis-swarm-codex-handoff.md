@@ -2,15 +2,16 @@
 
 ## Current Direction
 
-Aegis Swarm is now a **Plonky2-only laptop/backpack verifier demo**.
+Aegis Swarm is now a **Plonky2 recursive aggregation + required Groth16 final
+wrap** laptop/backpack verifier demo.
 
-The ESP32/Groth16 path has been removed from the active implementation. Do not
-reintroduce ESP32 verification, BN254 wrapping, Groth16, Circom, or snarkjs
-without an explicit architecture decision.
+The ESP32 verifier path remains out of scope. BN254 Groth16 wrapping is back in
+scope and is required for the command-center deliverable.
 
 ## Active Demo
 
-- Proving system: Plonky2.
+- Proving system: Plonky2 for recursive aggregation, BN254 Groth16 for the
+  final wrapper.
 - Native field: Goldilocks.
 - Hash function: Plonky2 Poseidon over Goldilocks.
 - Verifier device: laptop, framed as a field/backpack edge computer.
@@ -28,6 +29,8 @@ The laptop verifier:
 - binds epoch, command-center nonce, Merkle root, input bitmap, and output
   bitmap as public inputs,
 - recursively verifies the previous step proof inside Plonky2,
+- wraps the verified Plonky2 artifact in a BN254 Groth16 proof before reporting
+  the command-center payload size,
 - enforces bitmap continuity and no double-attesting for the current drone bit,
 - serves JSON at `/api/epoch`,
 - serves a static dashboard at `/`.
@@ -124,13 +127,13 @@ Use N=10 for live dashboard demos. Use N=100 as a capability/benchmark run.
 Say:
 
 - "recursive STARK aggregation via Plonky2"
+- "required final Groth16 command-center payload"
 - "field laptop/backpack verifier"
 - "verifier-approved edge view"
 
 Do not claim:
 
 - ESP32 verification,
-- Groth16 wrapping,
 - hardware impersonation defense,
 - real MANET implementation,
 - real drone communication,

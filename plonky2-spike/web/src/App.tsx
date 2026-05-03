@@ -582,7 +582,7 @@ function CommanderInspectorContent({
         items={[
           "drones create leaf proofs for their shard hashes",
           "H1 aggregators fold child proofs into grouped public inputs",
-          "the commander checks one recursive root proof and bitmap",
+          "the commander checks the required Groth16 wrap and bitmap",
         ]}
       />
 
@@ -611,7 +611,7 @@ function CommanderInspectorContent({
           value={proofVerdict}
           tone={epoch?.accepted ? "good" : epoch ? "bad" : "muted"}
         />
-        <InfoMetric label="Proof bytes" value={epoch ? `${epoch.proof_bytes} B` : "pending"} />
+        <InfoMetric label="Final Groth16 payload" value={epoch ? `${epoch.proof_bytes} B` : "pending"} />
       </div>
 
       <div className="exchange-route">
@@ -830,22 +830,23 @@ function CoreInspectorContent({
   return (
     <>
       <div className="info-grid">
-        <InfoMetric label="Core" value="recursive root" />
+        <InfoMetric label="Core" value="Groth16 wrap" />
         <InfoMetric label="Leaves" value={`${participantCount || 0}`} />
         <InfoMetric label="State" value={simulationActive ? "merging" : "idle"} />
-        <InfoMetric label="Proof bytes" value={epoch ? `${epoch.proof_bytes} B` : "pending"} />
+        <InfoMetric label="Final Groth16 payload" value={epoch ? `${epoch.proof_bytes} B` : "pending"} />
         <InfoMetric label="Prove" value={epoch ? `${epoch.prove_ms} ms` : "pending"} />
         <InfoMetric label="Verify" value={epoch ? `${epoch.verify_ms} ms` : "pending"} />
       </div>
       <PayloadSection
-        title="Root proof contains"
-        subtitle="The final compact object sent to the commander"
+        title="Command-center payload"
+        subtitle="The Groth16 proof sent by the last drone to command center"
         items={[
-          "recursive proof",
+          "BN254 Groth16 proof",
+          "Groth16 public inputs",
+          "Plonky2 proof fingerprint",
           "final bitmap limbs",
           "epoch nonce",
           "expected root",
-          "public input vector",
         ]}
       />
     </>

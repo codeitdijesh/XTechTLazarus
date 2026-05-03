@@ -1,11 +1,13 @@
 # Aegis Laptop Verifier
 
 This is the active Aegis Swarm proof path after the pivot to a laptop/backpack
-edge verifier. It is Plonky2-only:
+edge verifier. Plonky2 is the recursive aggregation layer; Groth16 is the
+required final command-center wrap:
 
 - native Goldilocks/Poseidon proof,
 - Poseidon Merkle shard-possession proof,
 - recursive Plonky2 chain verification,
+- BN254 Groth16 final-stage wrapper,
 - verifier-approved JSON epoch state,
 - static dashboard sourced only from verifier output.
 
@@ -26,6 +28,16 @@ Expected marker:
 ```text
 AEGIS_PLONKY2_RECURSIVE_CHAIN_OK
 ```
+
+The JSON reports both the final Groth16 payload (`proof_bytes`) and the
+intermediate Plonky2 artifact (`plonky2_intermediate_proof_bytes`). The
+Plonky2 proof is not the deliverable.
+
+Current Groth16 scope: the backend first verifies the Plonky2 recursive proof
+natively, then produces and verifies a BN254 Groth16 wrapper that binds the
+Plonky2 proof artifact fingerprint, epoch, nonce, root, bitmap, and proof
+length. This is a real Groth16 proof stage over an R1CS wrapper circuit; it is
+not yet an in-circuit Plonky2 verifier implemented inside BN254 R1CS.
 
 The 10-drone path is the intended live-demo size. A 100-drone run is supported
 but took about 50.6s end to end in the current local measurement.
