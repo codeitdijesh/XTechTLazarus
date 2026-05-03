@@ -10,6 +10,11 @@ import type {
 import { clamp, statusTone } from "./lib/util";
 import { Fleet3D } from "./components/Fleet3D";
 import { Header } from "./components/Header";
+import {
+  AnalyticsView,
+  TabBar,
+  type AnalyticsTab,
+} from "./components/AnalyticsTabs";
 
 const POLL_MS = 5000;
 
@@ -123,6 +128,7 @@ export function App() {
   const [selection, setSelection] = useState<InspectorSelection>({ type: "commander" });
   const [proofSimulation, setProofSimulation] =
     useState<ProofSimulation>(INITIAL_SIMULATION);
+  const [tab, setTab] = useState<AnalyticsTab>("ops");
 
   const controlRef = useRef(control);
   controlRef.current = control;
@@ -279,6 +285,21 @@ export function App() {
         integrityClean={swarm?.integrity_clean ?? true}
       />
 
+      <TabBar active={tab} onSelect={setTab} />
+
+      {tab !== "ops" && (
+        <AnalyticsView
+          tab={tab}
+          data={{
+            drones: displayDrones,
+            participants: graphParticipants,
+            epoch,
+            controlDrones: control.drones,
+          }}
+        />
+      )}
+
+      {tab === "ops" && (
       <main className="visual-full">
         <div className={`stage full ${alarm ? "alert" : ""}`}>
           <div className="stage-topbar">
@@ -343,6 +364,7 @@ export function App() {
           />
         </div>
       </main>
+      )}
 
       {error && (
         <div className="toast error" onClick={() => setError(null)}>

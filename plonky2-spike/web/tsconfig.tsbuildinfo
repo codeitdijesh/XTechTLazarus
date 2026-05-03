@@ -1,1 +1,1 @@
-{"root":["./src/App.tsx","./src/main.tsx","./src/components/Fleet3D.tsx","./src/components/Header.tsx","./src/lib/api.ts","./src/lib/theme.ts","./src/lib/types.ts","./src/lib/util.ts"],"version":"5.9.3"}
+{"root":["./src/App.tsx","./src/main.tsx","./src/components/AnalyticsTabs.tsx","./src/components/Fleet3D.tsx","./src/components/Header.tsx","./src/lib/api.ts","./src/lib/theme.ts","./src/lib/types.ts","./src/lib/util.ts"],"version":"5.9.3"}
