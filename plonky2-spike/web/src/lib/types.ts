@@ -2,6 +2,7 @@ export type ProofMode = "recursive_chain" | string;
 
 export interface VerifiedEpoch {
   epoch: number;
+  nonce: string;
   drone_count: number;
   accepted: boolean;
   reason: string;
@@ -88,6 +89,25 @@ export interface SwarmState {
   files: FileManifestEntry[];
   commands: CommandRecord[];
   drones: DroneSummary[];
+}
+
+export interface ManetMetrics {
+  type: "metrics";
+  seq: number;
+  action: string;
+  sent: number;
+  delivered: number;
+  dropped: number;
+  avg_latency_ms: number;
+  avg_hops: number;
+  pdr: number;
+}
+
+export interface ManetState {
+  state: "ns3_running" | "ns3_unavailable" | "ns3_failed";
+  reason: string;
+  last_metrics: ManetMetrics | null;
+  events: Array<Record<string, unknown>>;
 }
 
 export interface FileReceipt {

@@ -79,21 +79,38 @@ GET  /api/drone?id=2
 POST /api/command
 POST /api/files
 POST /api/integrity
+GET  /api/manet
 ```
 
-`/api/command` records command delivery in the targeted drone state.
-`/api/files` stores pushed file metadata and expected Poseidon content hashes in
-the manifest. `/api/integrity` recomputes per-drone file state against that
-manifest and returns missing/mismatched files. This is a real local backend
-model, not a frontend-only visualization, but it is not a radio/MANET transport
-or hardware drone integration.
+`/api/command`, `/api/files`, `/api/integrity`, and dashboard epoch collection
+route through the MANET controller. The runtime target is the real ns-3 sidecar
+in `ns3/aegis-manet-sidecar.cc`, launched by `scripts/run-ns3-sidecar.sh`.
+
+Install ns-3 externally and set:
+
+```sh
+export NS3_ROOT=/path/to/ns-3
+scripts/check-ns3.sh
+```
+
+If ns-3 is unavailable, the server still starts and serves the dashboard, but
+MANET actions are disabled and mutation endpoints return explicit errors. There
+is no silent local fallback pretending MANET delivery happened.
+
+When the sidecar runs, it writes research artifacts under
+`plonky2-spike/runs/latest/` by default:
+
+- `events.jsonl`
+- `metrics.csv`
+- `deliveries.csv`
 
 ## Public Inputs
 
 Every step proof exposes the same public input layout so recursive proofs can
 bind the next step to the previous one:
 
-- epoch nonce,
+- epoch,
+- command-center nonce,
 - expected Poseidon Merkle root,
 - input participation bitmap limbs `[u32; 4]`,
 - output participation bitmap limbs `[u32; 4]`.
@@ -108,10 +125,11 @@ Each participating drone step proves:
 - the output bitmap sets exactly that bit,
 - all other bitmap bits are unchanged,
 - when present, the previous Plonky2 proof verifies recursively and its
-  epoch/root/output bitmap equal this step's epoch/root/input bitmap.
+  epoch/nonce/root/output bitmap equal this step's epoch/nonce/root/input
+  bitmap.
 
 Dropout is represented by an unset participation bit. Corrupt shards and replay
-epochs are rejected.
+nonces are rejected. The server also rejects a reused `(epoch, nonce)` pair.
 
 ## Tests
 
@@ -120,8 +138,9 @@ cd plonky2-spike
 cargo test --release -- --nocapture
 ```
 
-Current tests cover a valid small chain, corrupt shard rejection, replay
-rejection, and dropout acceptance with the missing bit preserved.
+Current tests cover a valid small chain, corrupt shard rejection, stale nonce
+replay rejection, reused epoch nonce rejection, and dropout acceptance with the
+missing bit preserved.
 
 ## ESP32 Status
 

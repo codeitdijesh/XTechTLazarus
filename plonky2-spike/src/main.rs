@@ -1,13 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use plonky2::field::goldilocks_field::GoldilocksField;
@@ -29,9 +31,10 @@ const MERKLE_HEIGHT: usize = 7;
 const MERKLE_LEAVES: usize = 1 << MERKLE_HEIGHT;
 
 const PI_EPOCH: usize = 0;
-const PI_ROOT_START: usize = 1;
-const PI_BITMAP_OUT_START: usize = 9;
-const PI_LEN: usize = 13;
+const PI_NONCE: usize = 1;
+const PI_ROOT_START: usize = 2;
+const PI_BITMAP_OUT_START: usize = 10;
+const PI_LEN: usize = 14;
 
 type F = GoldilocksField;
 type C = PoseidonGoldilocksConfig;
@@ -51,8 +54,10 @@ fn main() -> Result<()> {
             .min(drone_count.saturating_sub(1));
 
         let engine = VerifierEngine::new();
+        let nonce = challenge_nonce(1);
         let epoch = engine.verify_epoch(EpochRequest {
             epoch: 1,
+            nonce,
             drone_count,
             fault: Fault {
                 kind: fault,
@@ -131,8 +136,9 @@ fn handle_stream(engine: &VerifierEngine, epoch: &AtomicU64, stream: &mut TcpStr
             .unwrap_or(default_fault_drone)
             .min(drone_count - 1);
 
-        let state = engine.verify_epoch(EpochRequest {
+        let state = engine.verify_epoch_over_manet(EpochRequest {
             epoch: current_epoch,
+            nonce: challenge_nonce(current_epoch),
             drone_count,
             fault: Fault {
                 kind: fault_kind,
@@ -140,6 +146,12 @@ fn handle_stream(engine: &VerifierEngine, epoch: &AtomicU64, stream: &mut TcpStr
             },
         });
         write_response(stream, "200 OK", "application/json", &state.to_json())?;
+        return Ok(());
+    }
+
+    if request.method == "GET" && path.starts_with("/api/manet") {
+        let body = engine.manet_json()?;
+        write_response(stream, "200 OK", "application/json", &body)?;
         return Ok(());
     }
 
@@ -207,6 +219,8 @@ struct VerifierEngine {
     data: DemoData,
     swarm: Mutex<SwarmState>,
     step_circuits: Mutex<HashMap<CircuitKey, Arc<StepCircuit>>>,
+    used_challenges: Mutex<HashSet<(u64, u64)>>,
+    manet: Mutex<ManetRuntime>,
 }
 
 impl VerifierEngine {
@@ -215,30 +229,77 @@ impl VerifierEngine {
             data: DemoData::new(),
             swarm: Mutex::new(SwarmState::new()),
             step_circuits: Mutex::new(HashMap::new()),
+            used_challenges: Mutex::new(HashSet::new()),
+            manet: Mutex::new(ManetRuntime::start()),
         }
     }
 
     fn verify_epoch(&self, request: EpochRequest) -> VerifiedEpoch {
+        let participants = request.participating_drones();
+        self.verify_epoch_with_participants(request, participants)
+    }
+
+    fn verify_epoch_over_manet(&self, request: EpochRequest) -> VerifiedEpoch {
+        let target_ids = request.participating_drones();
+        let delivery = self.manet_send(ManetAction::CollectEpoch, request.drone_count, &target_ids);
+        match delivery {
+            Ok(delivery) if !delivery.delivered.is_empty() => {
+                let participants = delivery.delivered;
+                self.verify_epoch_with_participants(request, participants)
+            }
+            Ok(delivery) => VerifiedEpoch::rejected(
+                request,
+                format!(
+                    "MANET delivered no attestations: {}",
+                    delivery
+                        .reason
+                        .unwrap_or_else(|| "empty delivery set".to_string())
+                ),
+            ),
+            Err(err) => VerifiedEpoch::rejected(request, format!("MANET unavailable: {err}")),
+        }
+    }
+
+    fn verify_epoch_with_participants(
+        &self,
+        request: EpochRequest,
+        participants: Vec<usize>,
+    ) -> VerifiedEpoch {
         let start = Instant::now();
-        let result = self.prove_chain(&request);
+        let result = self.prove_chain_with_participants(&request, participants);
         let total_ms = start.elapsed().as_millis();
 
         match result {
             Ok(stats) => {
                 let stale_epoch = stats.public_epoch != request.epoch;
+                let stale_nonce = stats.public_nonce != request.nonce;
                 let root_matches = stats.public_root == self.data.root;
-                let accepted = !stale_epoch && root_matches;
+                let fresh_challenge = if stale_epoch || stale_nonce || !root_matches {
+                    false
+                } else {
+                    self.record_challenge_if_unused(request.epoch, request.nonce)
+                        .unwrap_or(false)
+                };
+                let accepted = !stale_epoch && !stale_nonce && root_matches && fresh_challenge;
                 let reason = if accepted {
                     "verified recursive shard-possession chain"
                 } else if stale_epoch {
                     "rejected stale epoch public input"
+                } else if stale_nonce {
+                    "rejected stale nonce public input"
                 } else {
+                    "rejected reused epoch nonce"
+                };
+                let reason = if !root_matches {
                     "rejected unexpected Merkle root public input"
+                } else {
+                    reason
                 };
                 let _ = self.record_epoch(&request, &stats, accepted);
 
                 VerifiedEpoch {
                     epoch: request.epoch,
+                    nonce: request.nonce,
                     drone_count: request.drone_count,
                     accepted,
                     reason,
@@ -254,34 +315,27 @@ impl VerifierEngine {
                     implemented_proof_mode: "recursive_chain",
                 }
             }
-            Err(err) => VerifiedEpoch {
-                epoch: request.epoch,
-                drone_count: request.drone_count,
-                accepted: false,
-                reason: Box::leak(
-                    format!("proof failed: {}", json_escape(&err.to_string())).into_boxed_str(),
-                ),
-                participation_bitmap: [0; 4],
-                verified_count: 0,
-                dropouts: request.dropouts(),
-                proof_bytes: 0,
-                public_inputs: PI_LEN,
-                prove_ms: total_ms,
-                verify_ms: 0,
+            Err(err) => VerifiedEpoch::rejected_with_timing(
+                request,
+                format!("proof failed: {}", json_escape(&err.to_string())),
                 total_ms,
-                proof_system: "Plonky2",
-                implemented_proof_mode: "recursive_chain",
-            },
+            ),
         }
     }
 
-    fn prove_chain(&self, request: &EpochRequest) -> Result<ChainStats> {
-        let proof_epoch = if matches!(request.fault.kind, FaultKind::Replay) {
-            request.epoch.saturating_sub(1)
+    fn prove_chain_with_participants(
+        &self,
+        request: &EpochRequest,
+        participants: Vec<usize>,
+    ) -> Result<ChainStats> {
+        let proof_epoch = request.epoch;
+        let proof_nonce = if matches!(request.fault.kind, FaultKind::Replay) {
+            stale_nonce_for_epoch(request.epoch, request.nonce)
         } else {
-            request.epoch
+            request.nonce
         };
         let proof_epoch_f = F::from_canonical_u64(proof_epoch);
+        let proof_nonce_f = F::from_canonical_u64(proof_nonce);
         let root = self.data.root;
         let mut bitmap = [0u32; 4];
         let mut previous: Option<(Proof, Arc<StepCircuit>)> = None;
@@ -289,7 +343,7 @@ impl VerifierEngine {
         let mut prove_ms = 0u128;
         let mut verify_ms = 0u128;
 
-        for drone_index in request.participating_drones() {
+        for drone_index in participants {
             let previous_circuit = previous.as_ref().map(|(_, circuit)| circuit.as_ref());
             let circuit = self.step_circuit(drone_index, previous_circuit)?;
             let bitmap_in = bitmap;
@@ -301,6 +355,7 @@ impl VerifierEngine {
             let mut witness = PartialWitness::new();
             witness.set_target(circuit.shard, shard)?;
             witness.set_target(circuit.epoch, proof_epoch_f)?;
+            witness.set_target(circuit.nonce, proof_nonce_f)?;
             witness.set_hash_target(circuit.expected_root, root)?;
             for (target, limb) in circuit.bitmap_in.iter().zip(bitmap_in.iter()) {
                 witness.set_target(*target, F::from_canonical_u32(*limb))?;
@@ -339,6 +394,7 @@ impl VerifierEngine {
         let final_stats = final_stats.context("no participating drones produced a proof")?;
         Ok(ChainStats {
             public_epoch: final_stats.public_epoch,
+            public_nonce: final_stats.public_nonce,
             public_root: final_stats.public_root,
             public_bitmap_out: final_stats.public_bitmap_out,
             public_inputs: final_stats.public_inputs,
@@ -410,6 +466,14 @@ impl VerifierEngine {
         Ok(())
     }
 
+    fn record_challenge_if_unused(&self, epoch: u64, nonce: u64) -> Result<bool> {
+        let mut used = self
+            .used_challenges
+            .lock()
+            .map_err(|_| anyhow!("challenge cache lock poisoned"))?;
+        Ok(used.insert((epoch, nonce)))
+    }
+
     fn swarm_json(&self, drone_count: usize) -> Result<String> {
         let mut swarm = self
             .swarm
@@ -417,6 +481,14 @@ impl VerifierEngine {
             .map_err(|_| anyhow!("swarm state lock poisoned"))?;
         swarm.ensure_drone_count(drone_count);
         Ok(swarm.to_json(drone_count))
+    }
+
+    fn manet_json(&self) -> Result<String> {
+        let manet = self
+            .manet
+            .lock()
+            .map_err(|_| anyhow!("MANET controller lock poisoned"))?;
+        Ok(manet.to_json())
     }
 
     fn drone_json(&self, id: usize) -> Result<String> {
@@ -439,7 +511,14 @@ impl VerifierEngine {
             .lock()
             .map_err(|_| anyhow!("swarm state lock poisoned"))?;
         swarm.ensure_drone_count(drone_count);
-        let receipt = swarm.dispatch_command(drone_count, target, command);
+        let target_ids = target.drones(drone_count);
+        let delivery = self.manet_send(
+            ManetAction::Command(command.to_string()),
+            drone_count,
+            &target_ids,
+        )?;
+        let receipt =
+            swarm.dispatch_command_to_ids(drone_count, target, command, &delivery.delivered);
         Ok(receipt.to_json())
     }
 
@@ -455,18 +534,39 @@ impl VerifierEngine {
             .lock()
             .map_err(|_| anyhow!("swarm state lock poisoned"))?;
         swarm.ensure_drone_count(drone_count);
-        let receipt = swarm.push_file(drone_count, target, name, contents)?;
+        let target_ids = target.drones(drone_count);
+        let delivery = self.manet_send(
+            ManetAction::File(name.to_string()),
+            drone_count,
+            &target_ids,
+        )?;
+        let receipt = swarm.push_file_to_ids(target, name, contents, &delivery.delivered)?;
         Ok(receipt.to_json())
     }
 
     fn check_integrity(&self, drone_count: usize) -> Result<String> {
+        let target_ids = (0..drone_count).collect::<Vec<_>>();
+        let delivery = self.manet_send(ManetAction::IntegrityProbe, drone_count, &target_ids)?;
         let mut swarm = self
             .swarm
             .lock()
             .map_err(|_| anyhow!("swarm state lock poisoned"))?;
         swarm.ensure_drone_count(drone_count);
-        let report = swarm.check_integrity(drone_count);
+        let report = swarm.check_integrity_for_ids(drone_count, &delivery.delivered);
         Ok(report.to_json())
+    }
+
+    fn manet_send(
+        &self,
+        action: ManetAction,
+        drone_count: usize,
+        target_ids: &[usize],
+    ) -> Result<ManetDelivery> {
+        let mut manet = self
+            .manet
+            .lock()
+            .map_err(|_| anyhow!("MANET controller lock poisoned"))?;
+        manet.send(action, drone_count, target_ids)
     }
 }
 
@@ -475,6 +575,7 @@ struct StepCircuit {
     data: CircuitData<F, C, D>,
     shard: Target,
     epoch: Target,
+    nonce: Target,
     expected_root: HashOutTarget,
     bitmap_in: [Target; 4],
     bitmap_out: [Target; 4],
@@ -497,6 +598,7 @@ fn build_step_circuit(
 
     let shard = builder.add_virtual_target();
     let epoch = builder.add_virtual_public_input();
+    let nonce = builder.add_virtual_public_input();
     let expected_root = builder.add_virtual_hash_public_input();
     let bitmap_in = builder.add_virtual_public_input_arr::<4>();
     let bitmap_out = builder.add_virtual_public_input_arr::<4>();
@@ -523,6 +625,7 @@ fn build_step_circuit(
             &mut builder,
             &previous_proof.public_inputs,
             epoch,
+            nonce,
             expected_root,
             bitmap_in,
         );
@@ -535,6 +638,7 @@ fn build_step_circuit(
         data,
         shard,
         epoch,
+        nonce,
         expected_root,
         bitmap_in,
         bitmap_out,
@@ -547,11 +651,13 @@ fn connect_previous_public_inputs(
     builder: &mut CircuitBuilder<F, D>,
     previous_public_inputs: &[Target],
     epoch: Target,
+    nonce: Target,
     expected_root: HashOutTarget,
     bitmap_in: [Target; 4],
 ) {
     debug_assert_eq!(previous_public_inputs.len(), PI_LEN);
     builder.connect(previous_public_inputs[PI_EPOCH], epoch);
+    builder.connect(previous_public_inputs[PI_NONCE], nonce);
     for i in 0..4 {
         builder.connect(
             previous_public_inputs[PI_ROOT_START + i],
@@ -931,6 +1037,261 @@ impl IntegrityReport {
     }
 }
 
+enum ManetAction {
+    Command(String),
+    File(String),
+    IntegrityProbe,
+    CollectEpoch,
+}
+
+impl ManetAction {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Command(_) => "command",
+            Self::File(_) => "file",
+            Self::IntegrityProbe => "integrity_probe",
+            Self::CollectEpoch => "collect_epoch",
+        }
+    }
+
+    fn label(&self) -> &str {
+        match self {
+            Self::Command(value) | Self::File(value) => value,
+            Self::IntegrityProbe => "integrity_probe",
+            Self::CollectEpoch => "collect_epoch",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ManetDelivery {
+    delivered: Vec<usize>,
+    reason: Option<String>,
+}
+
+struct ManetRuntime {
+    status: ManetRuntimeStatus,
+    recent_events: Vec<String>,
+    seq: u64,
+    last_metrics: Option<String>,
+}
+
+enum ManetRuntimeStatus {
+    Running(ManetProcess),
+    Unavailable(String),
+    Failed(String),
+}
+
+struct ManetProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+}
+
+impl ManetRuntime {
+    fn start() -> Self {
+        let mut runtime = Self {
+            status: ManetRuntimeStatus::Unavailable("ns-3 sidecar not started".to_string()),
+            recent_events: Vec::new(),
+            seq: 1,
+            last_metrics: None,
+        };
+        runtime.status = match spawn_manet_process() {
+            Ok(mut process) => {
+                let mut line = String::new();
+                match process.stdout.read_line(&mut line) {
+                    Ok(0) => ManetRuntimeStatus::Failed(
+                        "ns-3 sidecar exited before ready event".to_string(),
+                    ),
+                    Ok(_) if line.contains(r#""type":"ready""#) => {
+                        runtime.push_event(line.trim().to_string());
+                        ManetRuntimeStatus::Running(process)
+                    }
+                    Ok(_) => ManetRuntimeStatus::Failed(format!(
+                        "unexpected ns-3 sidecar startup line: {}",
+                        line.trim()
+                    )),
+                    Err(err) => ManetRuntimeStatus::Failed(format!(
+                        "failed reading ns-3 sidecar ready event: {err}"
+                    )),
+                }
+            }
+            Err(err) => ManetRuntimeStatus::Unavailable(err.to_string()),
+        };
+        runtime
+    }
+
+    fn send(
+        &mut self,
+        action: ManetAction,
+        drone_count: usize,
+        target_ids: &[usize],
+    ) -> Result<ManetDelivery> {
+        let seq = self.seq;
+        self.seq += 1;
+        let request = format!(
+            concat!(
+                r#"{{"type":"send","#,
+                r#""seq":{},"#,
+                r#""action":"{}","#,
+                r#""label":"{}","#,
+                r#""drone_count":{},"#,
+                r#""targets":[{}]"#,
+                "}}\n"
+            ),
+            seq,
+            action.kind(),
+            json_escape(action.label()),
+            drone_count,
+            target_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        let recent_events = &mut self.recent_events;
+        let last_metrics = &mut self.last_metrics;
+        match &mut self.status {
+            ManetRuntimeStatus::Running(process) => {
+                process
+                    .stdin
+                    .write_all(request.as_bytes())
+                    .context("write ns-3 sidecar request")?;
+                process
+                    .stdin
+                    .flush()
+                    .context("flush ns-3 sidecar request")?;
+                let mut delivery = None;
+                let mut received_metrics = false;
+                loop {
+                    let mut line = String::new();
+                    let read = process
+                        .stdout
+                        .read_line(&mut line)
+                        .context("read ns-3 sidecar event")?;
+                    if read == 0 {
+                        return Err(anyhow!("ns-3 sidecar exited"));
+                    }
+                    let event = line.trim().to_string();
+                    push_manet_event(recent_events, event.clone());
+                    let event_seq = json_number(&event, "seq");
+                    if event.contains(r#""type":"metrics""#) {
+                        *last_metrics = Some(event.clone());
+                        if event_seq == Some(seq) {
+                            received_metrics = true;
+                        }
+                    }
+                    if event.contains(r#""type":"delivery""#) && event_seq == Some(seq) {
+                        delivery = Some(ManetDelivery {
+                            delivered: json_usize_array(&event, "delivered"),
+                            reason: json_string(&event, "reason"),
+                        });
+                    }
+                    if let (Some(delivery), true) = (&delivery, received_metrics) {
+                        return Ok(delivery.clone());
+                    }
+                    if event.contains(r#""type":"error""#) && event_seq == Some(seq) {
+                        return Err(anyhow!(
+                            "{}",
+                            json_string(&event, "reason")
+                                .unwrap_or_else(|| "ns-3 sidecar error".to_string())
+                        ));
+                    }
+                }
+            }
+            ManetRuntimeStatus::Unavailable(reason) | ManetRuntimeStatus::Failed(reason) => {
+                Err(anyhow!("{reason}"))
+            }
+        }
+    }
+
+    fn to_json(&self) -> String {
+        let (state, reason) = match &self.status {
+            ManetRuntimeStatus::Running(_) => ("ns3_running", ""),
+            ManetRuntimeStatus::Unavailable(reason) => ("ns3_unavailable", reason.as_str()),
+            ManetRuntimeStatus::Failed(reason) => ("ns3_failed", reason.as_str()),
+        };
+        format!(
+            concat!(
+                "{{",
+                r#""state":"{}","#,
+                r#""reason":"{}","#,
+                r#""last_metrics":{},"#,
+                r#""events":[{}]"#,
+                "}}"
+            ),
+            state,
+            json_escape(reason),
+            self.last_metrics.as_deref().unwrap_or("null"),
+            self.recent_events
+                .iter()
+                .rev()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+
+    fn push_event(&mut self, event: String) {
+        push_manet_event(&mut self.recent_events, event);
+    }
+}
+
+fn push_manet_event(events: &mut Vec<String>, event: String) {
+    events.push(event);
+    if events.len() > 100 {
+        events.remove(0);
+    }
+}
+
+impl Drop for ManetProcess {
+    fn drop(&mut self) {
+        let _ = self.stdin.write_all(b"{\"type\":\"shutdown\"}\n");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_manet_process() -> Result<ManetProcess> {
+    let command = manet_sidecar_command().context(
+        "ns-3 sidecar unavailable; set AEGIS_NS3_SIDECAR or install ns-3 and use plonky2-spike/scripts/run-ns3-sidecar.sh",
+    )?;
+    let mut child = Command::new(&command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawn MANET sidecar {command}"))?;
+    let stdin = child.stdin.take().context("open MANET sidecar stdin")?;
+    let stdout = child.stdout.take().context("open MANET sidecar stdout")?;
+    Ok(ManetProcess {
+        child,
+        stdin,
+        stdout: BufReader::new(stdout),
+    })
+}
+
+fn manet_sidecar_command() -> Option<String> {
+    if let Ok(path) = env::var("AEGIS_NS3_SIDECAR") {
+        return Some(path);
+    }
+    let ns3_available = env::var("NS3_ROOT").is_ok()
+        || (std::path::Path::new("./ns3").is_file() && std::path::Path::new("./src").is_dir());
+    if !ns3_available {
+        return None;
+    }
+    let candidates = [
+        "scripts/run-ns3-sidecar.sh",
+        "plonky2-spike/scripts/run-ns3-sidecar.sh",
+    ];
+    candidates
+        .iter()
+        .find(|path| std::path::Path::new(path).exists())
+        .map(|path| (*path).to_string())
+}
+
 #[derive(Clone, Copy)]
 enum SwarmTarget {
     All,
@@ -1012,22 +1373,22 @@ impl SwarmState {
         }
     }
 
-    fn dispatch_command(
+    fn dispatch_command_to_ids(
         &mut self,
         drone_count: usize,
         target: SwarmTarget,
         command: &str,
+        delivered_ids: &[usize],
     ) -> CommandReceipt {
         let command = normalize_command(command);
-        let target_ids = target.drones(drone_count);
         let record = CommandRecord {
             id: self.next_command_id,
             command: command.clone(),
             target: target.label(drone_count),
-            delivered: target_ids.len(),
+            delivered: delivered_ids.len(),
         };
         self.next_command_id += 1;
-        for id in target_ids {
+        for id in delivered_ids.iter().copied().filter(|id| *id < drone_count) {
             let drone = &mut self.drones[id];
             drone.current_command = command.clone();
             drone.status = "commanded".to_string();
@@ -1043,19 +1404,19 @@ impl SwarmState {
         }
     }
 
-    fn push_file(
+    fn push_file_to_ids(
         &mut self,
-        drone_count: usize,
         target: SwarmTarget,
         name: &str,
         contents: &str,
+        delivered_ids: &[usize],
     ) -> Result<FileReceipt> {
         let name = sanitize_file_name(name)?;
         let hash = content_hash_hex(contents);
         let bytes = contents.len();
         let version = self.next_file_version;
         self.next_file_version += 1;
-        let target_ids = target.drones(drone_count);
+        let target_ids = delivered_ids.to_vec();
         let file = DroneFile {
             name: name.clone(),
             hash: hash.clone(),
@@ -1087,11 +1448,14 @@ impl SwarmState {
             bytes,
             version,
             delivered: target_ids.len(),
-            expected_drones: target_ids,
+            expected_drones: match target {
+                SwarmTarget::All => delivered_ids.to_vec(),
+                SwarmTarget::Drone(_) => delivered_ids.to_vec(),
+            },
         })
     }
 
-    fn check_integrity(&mut self, drone_count: usize) -> IntegrityReport {
+    fn check_integrity_for_ids(&mut self, drone_count: usize, ids: &[usize]) -> IntegrityReport {
         for drone in self.drones.iter_mut().take(drone_count) {
             drone.integrity_ok = true;
         }
@@ -1110,7 +1474,7 @@ impl SwarmState {
                 .expected_drones
                 .iter()
                 .copied()
-                .filter(|id| *id < drone_count)
+                .filter(|id| *id < drone_count && ids.contains(id))
             {
                 let drone = &mut self.drones[id];
                 match drone.files.iter().find(|file| file.name == manifest.name) {
@@ -1235,6 +1599,7 @@ impl FaultKind {
 
 struct EpochRequest {
     epoch: u64,
+    nonce: u64,
     drone_count: usize,
     fault: Fault,
 }
@@ -1262,6 +1627,7 @@ impl EpochRequest {
 
 struct ProofStats {
     public_epoch: u64,
+    public_nonce: u64,
     public_root: HashOut<F>,
     public_bitmap_out: [u32; 4],
     public_inputs: usize,
@@ -1288,6 +1654,7 @@ impl ProofStats {
         ];
         Self {
             public_epoch: public_inputs[PI_EPOCH].to_canonical_u64(),
+            public_nonce: public_inputs[PI_NONCE].to_canonical_u64(),
             public_root,
             public_bitmap_out,
             public_inputs: public_inputs.len(),
@@ -1298,6 +1665,7 @@ impl ProofStats {
 
 struct ChainStats {
     public_epoch: u64,
+    public_nonce: u64,
     public_root: HashOut<F>,
     public_bitmap_out: [u32; 4],
     public_inputs: usize,
@@ -1308,6 +1676,7 @@ struct ChainStats {
 
 struct VerifiedEpoch {
     epoch: u64,
+    nonce: u64,
     drone_count: usize,
     accepted: bool,
     reason: &'static str,
@@ -1324,11 +1693,36 @@ struct VerifiedEpoch {
 }
 
 impl VerifiedEpoch {
+    fn rejected(request: EpochRequest, reason: String) -> Self {
+        Self::rejected_with_timing(request, reason, 0)
+    }
+
+    fn rejected_with_timing(request: EpochRequest, reason: String, total_ms: u128) -> Self {
+        Self {
+            epoch: request.epoch,
+            nonce: request.nonce,
+            drone_count: request.drone_count,
+            accepted: false,
+            reason: Box::leak(reason.into_boxed_str()),
+            participation_bitmap: [0; 4],
+            verified_count: 0,
+            dropouts: request.dropouts(),
+            proof_bytes: 0,
+            public_inputs: PI_LEN,
+            prove_ms: total_ms,
+            verify_ms: 0,
+            total_ms,
+            proof_system: "Plonky2",
+            implemented_proof_mode: "recursive_chain",
+        }
+    }
+
     fn to_json(&self) -> String {
         format!(
             concat!(
                 "{{",
                 r#""epoch":{},"#,
+                r#""nonce":"{:016x}","#,
                 r#""drone_count":{},"#,
                 r#""accepted":{},"#,
                 r#""reason":"{}","#,
@@ -1346,6 +1740,7 @@ impl VerifiedEpoch {
                 "}}"
             ),
             self.epoch,
+            self.nonce,
             self.drone_count,
             self.accepted,
             self.reason,
@@ -1563,8 +1958,76 @@ fn parse_usize_arg(args: &[String], key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn challenge_nonce(epoch: u64) -> u64 {
+    let mut bytes = [0u8; 8];
+    if let Ok(mut random) = File::open("/dev/urandom")
+        && random.read_exact(&mut bytes).is_ok()
+    {
+        let nonce = u64::from_le_bytes(bytes);
+        if nonce != 0 {
+            return nonce;
+        }
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let mixed =
+        (now.as_nanos() as u64) ^ epoch.rotate_left(17) ^ ((std::process::id() as u64) << 32);
+    mixed.max(1)
+}
+
+fn stale_nonce_for_epoch(epoch: u64, nonce: u64) -> u64 {
+    let stale = nonce ^ 0xa361_5e0d_badc_0ffe ^ epoch.rotate_left(9);
+    stale.max(1)
+}
+
 fn json_escape(input: &str) -> String {
     input.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn json_number(input: &str, key: &str) -> Option<u64> {
+    let marker = format!(r#""{key}":"#);
+    let start = input.find(&marker)? + marker.len();
+    let digits = input[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+fn json_usize_array(input: &str, key: &str) -> Vec<usize> {
+    let marker = format!(r#""{key}":["#);
+    let Some(start) = input.find(&marker).map(|pos| pos + marker.len()) else {
+        return Vec::new();
+    };
+    let Some(end) = input[start..].find(']').map(|pos| start + pos) else {
+        return Vec::new();
+    };
+    input[start..end]
+        .split(',')
+        .filter_map(|item| item.trim().parse::<usize>().ok())
+        .collect()
+}
+
+fn json_string(input: &str, key: &str) -> Option<String> {
+    let marker = format!(r#""{key}":""#);
+    let start = input.find(&marker)? + marker.len();
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in input[start..].chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(out);
+        } else {
+            out.push(ch);
+        }
+    }
+    None
 }
 
 fn normalize_command(command: &str) -> String {
@@ -1622,6 +2085,7 @@ mod tests {
         let engine = VerifierEngine::new();
         let state = engine.verify_epoch(EpochRequest {
             epoch: 7,
+            nonce: 0x1007,
             drone_count: 3,
             fault: Fault {
                 kind: FaultKind::None,
@@ -1637,6 +2101,7 @@ mod tests {
         let engine = VerifierEngine::new();
         let state = engine.verify_epoch(EpochRequest {
             epoch: 7,
+            nonce: 0x2007,
             drone_count: 3,
             fault: Fault {
                 kind: FaultKind::CorruptShard,
@@ -1651,6 +2116,7 @@ mod tests {
         let engine = VerifierEngine::new();
         let state = engine.verify_epoch(EpochRequest {
             epoch: 7,
+            nonce: 0x3007,
             drone_count: 3,
             fault: Fault {
                 kind: FaultKind::Replay,
@@ -1658,7 +2124,26 @@ mod tests {
             },
         });
         assert!(!state.accepted);
-        assert!(state.reason.contains("stale epoch"));
+        assert!(state.reason.contains("stale nonce"));
+    }
+
+    #[test]
+    fn reused_epoch_nonce_rejects() {
+        let engine = VerifierEngine::new();
+        let request = || EpochRequest {
+            epoch: 8,
+            nonce: 0x8008,
+            drone_count: 3,
+            fault: Fault {
+                kind: FaultKind::None,
+                drone: 0,
+            },
+        };
+        let first = engine.verify_epoch(request());
+        assert!(first.accepted, "{}", first.to_json());
+        let second = engine.verify_epoch(request());
+        assert!(!second.accepted);
+        assert!(second.reason.contains("reused epoch nonce"));
     }
 
     #[test]
@@ -1666,6 +2151,7 @@ mod tests {
         let engine = VerifierEngine::new();
         let state = engine.verify_epoch(EpochRequest {
             epoch: 7,
+            nonce: 0x4007,
             drone_count: 4,
             fault: Fault {
                 kind: FaultKind::Dropout,
@@ -1679,34 +2165,36 @@ mod tests {
 
     #[test]
     fn command_dispatch_updates_drone_state() {
-        let engine = VerifierEngine::new();
-        let body = engine
-            .dispatch_command(4, SwarmTarget::Drone(2), "return_to_base")
-            .unwrap();
+        let mut swarm = SwarmState::new();
+        swarm.ensure_drone_count(4);
+        let body = swarm
+            .dispatch_command_to_ids(4, SwarmTarget::Drone(2), "return_to_base", &[2])
+            .to_json();
         assert!(body.contains(r#""accepted":true"#));
-        let detail = engine.drone_json(2).unwrap();
+        let detail = swarm.drone_json(2);
         assert!(detail.contains("return_to_base"));
         assert!(detail.contains("commanded"));
     }
 
     #[test]
     fn file_push_and_integrity_check_are_backed_by_state() {
-        let engine = VerifierEngine::new();
-        let pushed = engine
-            .push_file(
-                4,
+        let mut swarm = SwarmState::new();
+        swarm.ensure_drone_count(4);
+        let pushed = swarm
+            .push_file_to_ids(
                 SwarmTarget::All,
                 "mission.json",
                 r#"{"route":"alpha","altitude":120}"#,
+                &[0, 1, 2, 3],
             )
             .unwrap();
-        assert!(pushed.contains(r#""delivered":4"#));
+        assert!(pushed.to_json().contains(r#""delivered":4"#));
 
-        let report = engine.check_integrity(4).unwrap();
+        let report = swarm.check_integrity_for_ids(4, &[0, 1, 2, 3]).to_json();
         assert!(report.contains(r#""clean":true"#));
         assert!(report.contains(r#""ok":4"#));
 
-        let detail = engine.drone_json(1).unwrap();
+        let detail = swarm.drone_json(1);
         assert!(detail.contains("mission.json"));
     }
 }

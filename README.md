@@ -23,8 +23,8 @@ AEGIS_PLONKY2_RECURSIVE_CHAIN_OK
 
 The implemented proof path is a recursive Plonky2 chain. Each participating
 drone step proves possession of its shard with a Poseidon Merkle inclusion
-proof, carries epoch/root/bitmap public inputs, and recursively verifies the
-previous step proof.
+proof, carries epoch/nonce/root/bitmap public inputs, and recursively verifies
+the previous step proof.
 
 ## Dashboard
 
@@ -45,16 +45,39 @@ simulator ground truth.
 The command-center controls are backed by local service state:
 
 - `POST /api/command` dispatches common commands to all drones or one selected
-  drone and records per-drone command history.
+  drone through the configured MANET sidecar and records per-drone command
+  history only for delivered drones.
 - `POST /api/files` pushes file contents into the selected swarm target and
-  updates the expected file manifest with a Poseidon digest.
-- `POST /api/integrity` recomputes every expected drone/file digest against the
-  manifest and reports missing or mismatched files.
+  updates the expected file manifest with a Poseidon digest after MANET
+  delivery.
+- `POST /api/integrity` probes over MANET, then recomputes every responding
+  drone/file digest against the manifest and reports missing or mismatched
+  files.
 - `GET /api/drone?id=N` returns individual drone status, files, and command
   history.
+- `GET /api/manet` returns ns-3 availability, recent MANET events, and last
+  delivery metrics.
 
-This is still a laptop-local swarm backend. It does not claim radio transport,
-MANET delivery, or real drone hardware integration.
+The runtime target is a real ns-3 sidecar. Install ns-3 externally and set:
+
+```sh
+export NS3_ROOT=/path/to/ns-3
+```
+
+Then run:
+
+```sh
+cd plonky2-spike
+scripts/check-ns3.sh
+cargo run --release -- --serve
+```
+
+If ns-3 is unavailable, the dashboard remains available but MANET actions are
+disabled and API mutations return explicit errors. There is no silent local
+fallback pretending MANET delivery happened.
+
+When ns-3 runs, the sidecar writes `events.jsonl`, `metrics.csv`, and
+`deliveries.csv` under `plonky2-spike/runs/latest/` by default.
 
 Measured locally with `cargo run --release`:
 

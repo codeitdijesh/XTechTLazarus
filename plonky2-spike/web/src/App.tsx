@@ -4,12 +4,14 @@ import {
   dispatchCommand,
   fetchDrone,
   fetchEpoch,
+  fetchManet,
   fetchSwarm,
   pushFile,
 } from "./lib/api";
 import type {
   DroneDetail,
   FaultKind,
+  ManetState,
   SwarmState,
   Target,
   VerifiedEpoch,
@@ -60,6 +62,7 @@ export function App() {
   const [control, setControl] = useState<ControlState>(INITIAL_CONTROL);
   const [epoch, setEpoch] = useState<VerifiedEpoch | null>(null);
   const [swarm, setSwarm] = useState<SwarmState | null>(null);
+  const [manet, setManet] = useState<ManetState | null>(null);
   const [drone, setDrone] = useState<DroneDetail | null>(null);
   const [series, setSeries] = useState<MetricSeries>(EMPTY_SERIES);
   const [busy, setBusy] = useState(false);
@@ -116,12 +119,14 @@ export function App() {
       });
       setEpoch(ep);
       pushSeries(ep);
-      const [sw, dr] = await Promise.all([
+      const [sw, dr, mn] = await Promise.all([
         fetchSwarm(c.drones),
         fetchDrone(c.targetDrone),
+        fetchManet(),
       ]);
       setSwarm(sw);
       setDrone(dr);
+      setManet(mn);
       setError(null);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -134,12 +139,14 @@ export function App() {
   const refreshLight = useCallback(async () => {
     const c = controlRef.current;
     try {
-      const [sw, dr] = await Promise.all([
+      const [sw, dr, mn] = await Promise.all([
         fetchSwarm(c.drones),
         fetchDrone(c.targetDrone),
+        fetchManet(),
       ]);
       setSwarm(sw);
       setDrone(dr);
+      setManet(mn);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
@@ -227,6 +234,7 @@ export function App() {
   }, [epoch]);
   const accepted = epoch?.accepted ?? null;
   const alarm = accepted === false;
+  const manetAvailable = manet?.state === "ns3_running";
 
   const reasonText = useMemo(() => {
     if (!epoch) return "awaiting verifier signal";
@@ -241,6 +249,23 @@ export function App() {
         total={swarm?.drone_count ?? control.drones}
         integrityClean={swarm?.integrity_clean ?? true}
       />
+
+      <div className={`ticker ${manetAvailable ? "" : "alert"}`}>
+        <span className="label">MANET</span>
+        <div className="chips">
+          <span className={`chip ${manetAvailable ? "" : "empty"}`}>
+            {(manet?.state ?? "ns3_unavailable").toUpperCase()}
+          </span>
+          {manet?.last_metrics ? (
+            <>
+              <span className="chip">PDR {(manet.last_metrics.pdr * 100).toFixed(0)}%</span>
+              <span className="chip">{manet.last_metrics.avg_latency_ms.toFixed(1)} MS</span>
+              <span className="chip">{manet.last_metrics.avg_hops.toFixed(1)} HOPS</span>
+            </>
+          ) : null}
+        </div>
+        <span className="meta">{manetAvailable ? "NS-3 SIDEcar LINK ACTIVE" : manet?.reason ?? "NS-3 NOT AVAILABLE"}</span>
+      </div>
 
       <MetricStrip epoch={epoch} swarm={swarm} series={series} />
 
@@ -257,7 +282,7 @@ export function App() {
             onCommand={onCommand}
             onPushFile={onPushFile}
             onCheckIntegrity={onCheckIntegrity}
-            busy={busy}
+            busy={busy || !manetAvailable}
           />
           <Roster
             drones={drones}

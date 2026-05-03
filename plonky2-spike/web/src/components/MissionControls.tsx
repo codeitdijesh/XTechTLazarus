@@ -14,7 +14,7 @@ const FAULTS: Array<{ key: FaultKind; label: string }> = [
   { key: "none", label: "none" },
   { key: "dropout", label: "dropout" },
   { key: "corrupt", label: "corrupt shard" },
-  { key: "replay", label: "replay epoch" },
+  { key: "replay", label: "replay nonce" },
 ];
 
 interface Props {

@@ -4,3 +4,4 @@ target/
 node_modules/
 **/node_modules/
 *.tsbuildinfo
+plonky2-spike/runs/

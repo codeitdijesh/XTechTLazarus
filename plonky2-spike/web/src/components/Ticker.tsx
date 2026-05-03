@@ -22,7 +22,7 @@ export function Ticker({ epoch }: Props) {
         )}
       </div>
       <span className="meta">
-        {epoch ? `${epoch.proof_system.toUpperCase()} · ${epoch.implemented_proof_mode.toUpperCase()} · ${epoch.public_inputs} PI` : "AWAITING TELEMETRY"}
+        {epoch ? `${epoch.proof_system.toUpperCase()} · ${epoch.implemented_proof_mode.toUpperCase()} · ${epoch.public_inputs} PI · NONCE ${epoch.nonce.slice(-8).toUpperCase()}` : "AWAITING TELEMETRY"}
       </span>
     </div>
   );
