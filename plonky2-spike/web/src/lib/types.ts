@@ -108,11 +108,3 @@ export type FaultKind =
   | "replay";
 
 export type Target = "all" | "drone";
-
-export type DroneStatus =
-  | "verified"
-  | "dropout"
-  | "proof rejected"
-  | "commanded"
-  | "file synced"
-  | string;

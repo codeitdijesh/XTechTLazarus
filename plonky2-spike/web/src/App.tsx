@@ -178,6 +178,9 @@ export function App() {
           cmd,
         );
         await refreshLight();
+        setError(null);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
       } finally {
         setBusy(false);
       }
@@ -194,6 +197,9 @@ export function App() {
         control.fileContents,
       );
       await refreshLight();
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
@@ -204,6 +210,9 @@ export function App() {
     try {
       await checkIntegrity(control.drones);
       await refreshLight();
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }

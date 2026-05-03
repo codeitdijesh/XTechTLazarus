@@ -7,10 +7,6 @@ export function pad2(n: number): string {
   return String(n).padStart(2, "0");
 }
 
-export function pad3(n: number): string {
-  return String(n).padStart(3, "0");
-}
-
 export function fmtMs(ms: number): string {
   if (!Number.isFinite(ms)) return "—";
   if (ms < 1000) return `${ms.toFixed(0)} ms`;
@@ -47,12 +43,12 @@ export function bitmapHex(bitmap: [number, number, number, number]): string {
     .join(" ");
 }
 
-// Each u32 word, MSB-first, into an array of 0/1 booleans.
+// Each u32 word, LSB-first, matching the backend's drone-index bit order.
 export function bitmapBits(bitmap: [number, number, number, number]): boolean[] {
   const out: boolean[] = [];
   for (const w of bitmap) {
     const u = w >>> 0;
-    for (let i = 31; i >= 0; i--) out.push(((u >>> i) & 1) === 1);
+    for (let i = 0; i < 32; i++) out.push(((u >>> i) & 1) === 1);
   }
   return out;
 }

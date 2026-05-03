@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -205,6 +206,7 @@ fn handle_stream(engine: &VerifierEngine, epoch: &AtomicU64, stream: &mut TcpStr
 struct VerifierEngine {
     data: DemoData,
     swarm: Mutex<SwarmState>,
+    step_circuits: Mutex<HashMap<CircuitKey, Arc<StepCircuit>>>,
 }
 
 impl VerifierEngine {
@@ -212,6 +214,7 @@ impl VerifierEngine {
         Self {
             data: DemoData::new(),
             swarm: Mutex::new(SwarmState::new()),
+            step_circuits: Mutex::new(HashMap::new()),
         }
     }
 
@@ -281,14 +284,14 @@ impl VerifierEngine {
         let proof_epoch_f = F::from_canonical_u64(proof_epoch);
         let root = self.data.root;
         let mut bitmap = [0u32; 4];
-        let mut previous: Option<(Proof, VerifierCircuitData<F, C, D>)> = None;
+        let mut previous: Option<(Proof, Arc<StepCircuit>)> = None;
         let mut final_stats = None;
         let mut prove_ms = 0u128;
         let mut verify_ms = 0u128;
 
         for drone_index in request.participating_drones() {
-            let previous_data = previous.as_ref().map(|(_, verifier_data)| verifier_data);
-            let circuit = build_step_circuit(drone_index, previous_data);
+            let previous_circuit = previous.as_ref().map(|(_, circuit)| circuit.as_ref());
+            let circuit = self.step_circuit(drone_index, previous_circuit)?;
             let bitmap_in = bitmap;
             let mut bitmap_out = bitmap;
             set_participant(&mut bitmap_out, drone_index, true);
@@ -330,7 +333,7 @@ impl VerifierEngine {
 
             bitmap = bitmap_out;
             final_stats = Some(ProofStats::from_proof(&step_proof));
-            previous = Some((step_proof, circuit.data.verifier_data()));
+            previous = Some((step_proof, circuit));
         }
 
         let final_stats = final_stats.context("no participating drones produced a proof")?;
@@ -353,6 +356,44 @@ impl VerifierEngine {
         } else {
             self.data.shards[drone_index]
         }
+    }
+
+    fn step_circuit(
+        &self,
+        drone_index: usize,
+        previous: Option<&StepCircuit>,
+    ) -> Result<Arc<StepCircuit>> {
+        let key = CircuitKey {
+            path: previous
+                .map(|circuit| {
+                    let mut path = circuit.key.path.clone();
+                    path.push(drone_index);
+                    path
+                })
+                .unwrap_or_else(|| vec![drone_index]),
+        };
+
+        if let Some(cached) = self
+            .step_circuits
+            .lock()
+            .map_err(|_| anyhow!("step circuit cache lock poisoned"))?
+            .get(&key)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+
+        let previous_data = previous.map(|circuit| circuit.data.verifier_data());
+        let built = Arc::new(build_step_circuit(
+            key.clone(),
+            drone_index,
+            previous_data.as_ref(),
+        ));
+        let mut cache = self
+            .step_circuits
+            .lock()
+            .map_err(|_| anyhow!("step circuit cache lock poisoned"))?;
+        Ok(Arc::clone(cache.entry(key).or_insert(built)))
     }
 
     fn record_epoch(
@@ -430,6 +471,7 @@ impl VerifierEngine {
 }
 
 struct StepCircuit {
+    key: CircuitKey,
     data: CircuitData<F, C, D>,
     shard: Target,
     epoch: Target,
@@ -440,7 +482,13 @@ struct StepCircuit {
     previous_proof: Option<ProofWithPublicInputsTarget<D>>,
 }
 
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct CircuitKey {
+    path: Vec<usize>,
+}
+
 fn build_step_circuit(
+    key: CircuitKey,
     drone_index: usize,
     previous: Option<&VerifierCircuitData<F, C, D>>,
 ) -> StepCircuit {
@@ -483,6 +531,7 @@ fn build_step_circuit(
 
     let data = builder.build::<C>();
     StepCircuit {
+        key,
         data,
         shard,
         epoch,
@@ -555,7 +604,7 @@ struct DemoData {
 impl DemoData {
     fn new() -> Self {
         let shards = (0..MAX_DRONES)
-            .map(|index| F::from_canonical_u64(0xae615_0000_u64 + index as u64 + 1))
+            .map(|index| F::from_canonical_u64(0x000a_e615_0000_u64 + index as u64 + 1))
             .collect::<Vec<_>>();
         let mut leaves = shards
             .iter()
@@ -943,6 +992,7 @@ impl SwarmState {
 
     fn record_epoch(&mut self, request: &EpochRequest, bitmap: [u32; 4], accepted: bool) {
         self.ensure_drone_count(request.drone_count);
+        let dropout = request.dropout();
         for id in 0..request.drone_count {
             let participated = accepted && participant_at(bitmap, id);
             let drone = &mut self.drones[id];
@@ -954,7 +1004,7 @@ impl SwarmState {
                 drone.battery = drone
                     .battery
                     .saturating_sub(((request.epoch + id as u64) % 2) as u8);
-            } else if request.dropouts().contains(&id) {
+            } else if dropout == Some(id) {
                 drone.status = "dropout".to_string();
             } else if !accepted {
                 drone.status = "proof rejected".to_string();
@@ -1002,7 +1052,7 @@ impl SwarmState {
     ) -> Result<FileReceipt> {
         let name = sanitize_file_name(name)?;
         let hash = content_hash_hex(contents);
-        let bytes = contents.as_bytes().len();
+        let bytes = contents.len();
         let version = self.next_file_version;
         self.next_file_version += 1;
         let target_ids = target.drones(drone_count);
@@ -1191,17 +1241,22 @@ struct EpochRequest {
 
 impl EpochRequest {
     fn participating_drones(&self) -> Vec<usize> {
+        let dropout = self.dropout();
         (0..self.drone_count)
-            .filter(|&drone| !self.dropouts().contains(&drone))
+            .filter(|&drone| dropout != Some(drone))
             .collect()
     }
 
-    fn dropouts(&self) -> Vec<usize> {
+    fn dropout(&self) -> Option<usize> {
         match self.fault.kind {
-            FaultKind::Dropout => vec![self.fault.drone],
-            FaultKind::RotatingDropout if self.epoch % 5 == 0 => vec![self.fault.drone],
-            _ => Vec::new(),
+            FaultKind::Dropout => Some(self.fault.drone),
+            FaultKind::RotatingDropout if self.epoch.is_multiple_of(5) => Some(self.fault.drone),
+            _ => None,
         }
+    }
+
+    fn dropouts(&self) -> Vec<usize> {
+        self.dropout().into_iter().collect()
     }
 }
 
@@ -1362,10 +1417,10 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
                     .unwrap_or(0);
             }
         }
-        if let Some((end, delimiter_len)) = header_end {
-            if bytes.len() >= end + delimiter_len + content_length {
-                break;
-            }
+        if let Some((end, delimiter_len)) = header_end
+            && bytes.len() >= end + delimiter_len + content_length
+        {
+            break;
         }
         if bytes.len() > 128 * 1024 {
             return Err(anyhow!("request too large"));
