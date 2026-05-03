@@ -1,7 +1,7 @@
-# Aegis Laptop Verifier
+# Mycelium Commander Verifier
 
-This is the active Aegis Swarm proof path after the pivot to a laptop/backpack
-edge verifier. It is Plonky2-only:
+Mycelium is a data verification layer for drone swarms. The commander verifies
+recursive ZK proofs before trusting swarm data. The proof path is Plonky2-only:
 
 - native Goldilocks/Poseidon proof,
 - Poseidon Merkle shard-possession proof,
@@ -24,7 +24,7 @@ cargo run --release -- --drones 100
 Expected marker:
 
 ```text
-AEGIS_PLONKY2_RECURSIVE_CHAIN_OK
+MYCELIUM_RECURSIVE_ZK_COMMANDER_OK
 ```
 
 The 10-drone path is the intended live-demo size. A 100-drone run is supported

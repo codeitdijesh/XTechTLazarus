@@ -8,7 +8,7 @@ export function pad2(n: number): string {
 }
 
 export function fmtMs(ms: number): string {
-  if (!Number.isFinite(ms)) return "—";
+  if (!Number.isFinite(ms)) return "-";
   if (ms < 1000) return `${ms.toFixed(0)} ms`;
   return `${(ms / 1000).toFixed(2)} s`;
 }
@@ -20,7 +20,6 @@ export function fmtKb(bytes: number): string {
   return `${(kb / 1024).toFixed(2)} MB`;
 }
 
-// Status -> semantic colour token name (matches CSS variables in styles.css).
 export function statusTone(status: string): "good" | "bad" | "info" | "warn" | "muted" {
   switch (status) {
     case "verified":
@@ -43,7 +42,6 @@ export function bitmapHex(bitmap: [number, number, number, number]): string {
     .join(" ");
 }
 
-// Each u32 word, LSB-first, matching the backend's drone-index bit order.
 export function bitmapBits(bitmap: [number, number, number, number]): boolean[] {
   const out: boolean[] = [];
   for (const w of bitmap) {
@@ -53,8 +51,6 @@ export function bitmapBits(bitmap: [number, number, number, number]): boolean[] 
   return out;
 }
 
-// Fibonacci sphere: deterministic uniform points on a unit sphere.
-// Returns [x, y, z] for index i in a population of n.
 export function fibonacciPoint(i: number, n: number): [number, number, number] {
   const offset = 2 / Math.max(n, 1);
   const increment = Math.PI * (3 - Math.sqrt(5));

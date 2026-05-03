@@ -1,5 +1,5 @@
 import type { DroneSummary } from "../lib/types";
-import { pad2, statusTone } from "../lib/util";
+import { statusTone } from "../lib/util";
 import { PanelCorners } from "./PanelCorners";
 
 interface Props {
@@ -27,7 +27,7 @@ export function Roster({ drones, selected, onSelect }: Props) {
               onClick={() => onSelect(d.id)}
               title={d.callsign}
             >
-              <div className="id">DR-{pad2(d.id + 1)}</div>
+              <div className="id">Drone {d.id + 1}</div>
               <div className={`st ${tone}`}>{d.status}</div>
             </button>
           );

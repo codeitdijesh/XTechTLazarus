@@ -61,7 +61,7 @@ fn main() -> Result<()> {
         });
         println!("{}", epoch.to_json());
         if epoch.accepted {
-            println!("AEGIS_PLONKY2_RECURSIVE_CHAIN_OK");
+            println!("MYCELIUM_RECURSIVE_ZK_COMMANDER_OK");
             Ok(())
         } else {
             Err(anyhow!("verifier epoch was rejected: {}", epoch.reason))
@@ -73,7 +73,7 @@ fn serve(addr: &str) -> Result<()> {
     let engine = Arc::new(VerifierEngine::new());
     let epoch = Arc::new(AtomicU64::new(0));
     let listener = TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
-    println!("AEGIS_PLONKY2_RECURSIVE_CHAIN_SERVING http://{addr}");
+    println!("MYCELIUM_COMMANDER_VERIFIER_SERVING http://{addr}");
     println!("Open http://{addr}/ for the verifier-only dashboard");
 
     for stream in listener.incoming() {
@@ -675,7 +675,7 @@ impl DroneRuntime {
     fn new(id: usize) -> Self {
         Self {
             id,
-            callsign: format!("Aegis-{:02}", id + 1),
+            callsign: format!("Drone {}", id + 1),
             status: "standby".to_string(),
             battery: 96u8.saturating_sub((id % 17) as u8),
             link: 88u8.saturating_sub((id % 11) as u8),
